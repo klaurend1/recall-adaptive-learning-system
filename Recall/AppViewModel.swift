@@ -20,30 +20,63 @@ final class AppViewModel: ObservableObject {
 
     private var cancellables = Set<AnyCancellable>()
 
+    /// The knowledge graph engine instance built from current concepts, cards, and reviewRecords.
+    @Published var engine: KnowledgeGraphEngine = KnowledgeGraphEngine(
+        concepts: [],
+        cards: [],
+        reviews: []
+    )
+    
+    private func rebuildEngine() {
+        engine = KnowledgeGraphEngine(
+            concepts: concepts,
+            cards: cards,
+            reviews: reviewRecords
+        )
+    }
     init(setup: Bool = false) {
         loadState()
         if cards.isEmpty { cards = MockData.cards }
         if concepts.isEmpty { concepts = MockData.concepts }
 
         // Temporary migration: if any card references a conceptID not in current concepts, replace cards with seeded MockData.cards (preserve reviewRecords)
-        let validConceptIDs = Set(self.concepts.map { $0.id })
-        let hasOrphans = self.cards.contains { card in
-            card.conceptIDs.contains { !validConceptIDs.contains($0) }
-        }
-        if hasOrphans {
-            self.cards = MockData.cards
+        // Migrate older saved cards that do not have concept assignments
+        let seededConceptsByQuestion = Dictionary(
+            uniqueKeysWithValues: MockData.cards.map { ($0.question, $0.conceptIDs) }
+        )
+
+        for index in cards.indices {
+            if cards[index].conceptIDs.isEmpty,
+               let conceptIDs = seededConceptsByQuestion[cards[index].question] {
+                cards[index].conceptIDs = conceptIDs
+            }
         }
 
+        // Repair any cards whose concept IDs still do not exist
+        let validConceptIDs = Set(concepts.map { $0.id })
+
+        let hasOrphans = cards.contains { card in
+            card.conceptIDs.isEmpty ||
+            card.conceptIDs.contains { !validConceptIDs.contains($0) }
+        }
+
+        if hasOrphans {
+            print("Warning: Some cards still have invalid concept mappings")
+        }
+        
+        rebuildEngine()
+        engine = KnowledgeGraphEngine(
+            concepts: concepts,
+            cards: cards,
+            reviews: reviewRecords
+        )
+        
         #if DEBUG
         print("Recall cards:", cards.count)
         print("Recall concepts:", concepts.count)
         let conceptIDs = Set(concepts.map { $0.id })
         let allRefsResolve = cards.allSatisfy { card in card.conceptIDs.allSatisfy { conceptIDs.contains($0) } }
         print("All card conceptIDs resolve:", allRefsResolve)
-        let tree = MemoryTreeEngine.build(concepts: concepts, cards: cards, reviews: reviewRecords)
-        if let mcat = tree.roots.first(where: { $0.name == "MCAT" }) {
-            print("MCAT aggregated cards:", mcat.cardCount)
-        }
         #endif
 
         $cards
@@ -101,13 +134,14 @@ final class AppViewModel: ObservableObject {
         return cards.filter { Calendar.current.startOfDay(for: $0.dueDate) <= dayStart }.count
     }
 
-    // MARK: - Memory Tree Support
+    // MARK: - Knowledge Graph Support
 
     enum MemoryHealth {
         case strong
         case stable
         case weak
         case atRisk
+        case unlearned
 
         var label: String {
             switch self {
@@ -115,6 +149,7 @@ final class AppViewModel: ObservableObject {
             case .stable: return "Stable"
             case .weak: return "Weak"
             case .atRisk: return "At Risk"
+            case .unlearned: return "Unlearned"
             }
         }
 
@@ -124,83 +159,82 @@ final class AppViewModel: ObservableObject {
             case .stable: return "blue"
             case .weak: return "orange"
             case .atRisk: return "red"
+            case .unlearned: return "gray"
             }
         }
     }
 
-    /// Dictionary mapping parent concept ID to its immediate child concepts
-    var conceptChildren: [UUID: [Concept]] {
-        Dictionary(grouping: concepts.compactMap { $0.parentID != nil ? $0 : nil }, by: { $0.parentID! })
-    }
-
-    /// Dictionary mapping concept ID to the concept itself
+    // Expose conceptByID from engine
     var conceptByID: [UUID: Concept] {
-        Dictionary(uniqueKeysWithValues: concepts.map { ($0.id, $0) })
+        engine.conceptByID
     }
 
-    /// Dictionary mapping concept ID to array of cards belonging to that concept
-    func cardsByConceptID() -> [UUID: [StudyCard]] {
-        var result = [UUID: [StudyCard]]()
-        for card in cards {
-            for conceptID in card.conceptIDs {
-                result[conceptID, default: []].append(card)
-            }
+    // Expose parentByConceptID from engine (map conceptID to optional parent conceptID)
+    var parentByConceptID: [UUID: UUID?] {
+        // Pass concept IDs to engine, not full Concept objects
+        engine.parentByConceptID
+    }
+
+    // Expose childrenByConceptID from engine, but map UUID children to Concept objects
+    var childrenByConceptID: [UUID: [Concept]] {
+        var result: [UUID: [Concept]] = [:]
+        for (parentID, childIDs) in engine.childrenByConceptID {
+            // Pass concept.id (UUID) to engine, mapping here just transforms UUIDs to Concepts
+            result[parentID] = childIDs
         }
         return result
     }
 
-    /// Converts mastery (0..1) to a MemoryHealth category based on thresholds:
-    /// - nil mastery returns nil
-    /// - ≥ 0.8: .strong
-    /// - ≥ 0.6: .stable
-    /// - ≥ 0.4: .weak
-    /// - else: .atRisk
-    func health(for mastery: Double?) -> MemoryHealth? {
-        guard let m = mastery else { return nil }
-        switch m {
-        case 0.8...1.0: return .strong
-        case 0.6..<0.8: return .stable
-        case 0.4..<0.6: return .weak
-        case ..<0.4: return .atRisk
-        default: return nil
+    // Expose cardsByConceptID from engine, but map UUID card IDs to StudyCard objects
+    var cardsByConceptID: [UUID: [StudyCard]] {
+        var result: [UUID: [StudyCard]] = [:]
+        let cardsByID = Dictionary(uniqueKeysWithValues: cards.map { ($0.id, $0) })
+        for (conceptID, cardIDs) in engine.cardsByConceptID {
+            // Pass concept.id (UUID) to engine, mapping here just transforms UUIDs to StudyCards
+            result[conceptID] = cardIDs.compactMap { cardsByID[$0] }
+        }
+        return result
+    }
+
+    /// Converts engine HealthState to MemoryHealth category
+    func health(for healthState: KnowledgeGraphEngine.HealthState?) -> MemoryHealth? {
+        guard let state = healthState else { return nil }
+        switch state {
+        case .strong: return .strong
+        case .stable: return .stable
+        case .weak: return .weak
+        case .atRisk: return .atRisk
+        case .unlearned: return .unlearned
         }
     }
 
-    /// Returns up to `limit` leaf concepts with available mastery, sorted ascending by mastery.
-    /// Each tuple contains (Concept, masteryPercent as Int, cardCount)
-    func weakestLeafConcepts(limit: Int = 3) -> [(Concept, Int, Int)] {
-        let data = MemoryTreeEngine.build(concepts: concepts, cards: cards, reviews: reviewRecords)
-        // Map conceptID -> ConceptNode for quick lookup
-        let flat = data.flat
-        // For each Concept that is a leaf in the built tree and has mastery
-        let results: [(Concept, Int, Int)] = concepts.compactMap { concept in
-            guard let node = flat[concept.id], node.children.isEmpty, node.masteryPercent >= 0 else { return nil }
-            let percent = Int((node.masteryPercent * 100).rounded())
-            return (concept, percent, node.cardCount)
-        }
-        let sorted = results.sorted { $0.1 < $1.1 }
-        return Array(sorted.prefix(limit))
-    }
-}
-
-extension AppViewModel {
-    var conceptRoots: [ConceptNode] {
-        MemoryTreeEngine.build(concepts: concepts, cards: cards, reviews: reviewRecords).roots
+    /// Returns concepts that need attention, sorted by attention index descending.
+    var needsAttentionConcepts: [Concept] {
+        // Pass concept IDs (UUID) to engine.attentionConcepts if needed, here engine manages internally
+        engine.attentionConcepts(limit: 1000)
     }
 
-    var allConcepts: [ConceptNode] {
-        Array(MemoryTreeEngine.build(concepts: concepts, cards: cards, reviews: reviewRecords).flat.values)
-    }
+    /// Record a review and update card data with engine logic, then reschedule the card.
+    func recordReview(cardID: UUID, grade: ReviewGrade) {
+        guard let cardIndex = cards.firstIndex(where: { $0.id == cardID }) else { return }
 
-    func parentConcept(of node: ConceptNode) -> ConceptNode? {
-        let data = MemoryTreeEngine.build(concepts: concepts, cards: cards, reviews: reviewRecords)
-        if let pid = data.parent[node.id] ?? nil, let p = data.flat[pid] { return p }
-        return nil
-    }
+        // Create the new review record
+        let reviewDate = Date()
+        let newReview = ReviewRecord(cardID: cardID, date: reviewDate, grade: grade)
+        reviewRecords.append(newReview)
 
-    var weakestLeaves: [ConceptNode] {
-        let data = MemoryTreeEngine.build(concepts: concepts, cards: cards, reviews: reviewRecords)
-        let leaves = data.flat.values.filter { $0.children.isEmpty && $0.masteryPercent >= 0 }
-        return leaves.sorted { $0.masteryPercent < $1.masteryPercent }.prefix(3).map { $0 }
+        // Update card's spaced repetition data using the engine's logic
+        var card = cards[cardIndex]
+
+        engine.updateCard(card: &card, withReviewGrade: grade, at: reviewDate)
+
+        engine.rescheduleCardAfterReview(
+            card: &card,
+            after: grade,
+            at: reviewDate
+        )
+
+        cards[cardIndex] = card
+        rebuildEngine()
     }
 }
