@@ -30,6 +30,16 @@ Recall explores a simple idea:
 
 The current version is actively being developed.
 
+## Screenshots
+
+### Review
+![Recall review screen](screenshots/review2.png)
+
+![Recall review screen](screenshots/review.png)
+
+### Analytics
+![Recall analytics screen](screenshots/stats.png)
+
 ## Run
 
 ```bash
