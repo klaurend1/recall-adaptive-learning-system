@@ -40,6 +40,9 @@ The current version is actively being developed.
 ### Analytics
 ![Recall analytics screen](screenshots/stats.png)
 
+### Memory Tree
+![Memory Tree](screenshots/memorytree.png)
+
 ## Run
 
 ```bash
